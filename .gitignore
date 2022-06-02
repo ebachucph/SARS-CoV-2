@@ -5,8 +5,9 @@
 .Ruserdata
 
 # Ignore files in ./data folder and subfolders
-data/*
+data/**
 ## Except folders
+!data/*/
 !data/*/.gitkeep
 
 # Ignore all folders and files but ./docs/functions in ./docs
