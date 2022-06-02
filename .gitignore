@@ -7,7 +7,7 @@
 # Ignore files in ./data folder and subfolders
 data/*
 ## Except folders
-!data/**/.gitkeep
+!data/*/.gitkeep
 
 # Ignore all folders and files but ./docs/functions in ./docs
 docs/*

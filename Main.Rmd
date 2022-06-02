@@ -27,7 +27,7 @@ knitr::opts_chunk$set(echo = TRUE, time_it = TRUE)
 ## Loading libraries  
 Code chunk below will load the libraries and local functions in ./docs/functions required to run the analysis.
 
-```{r libraries, message=FALSE, warning=FALSE, echo=FALSE, results='hide'}
+```{r libraries, message=FALSE, warning=FALSE, results='hide'}
 # Load libraries
 library(tidyverse, quietly = T, warn.conflicts = F)
 library(Biostrings, quietly = T, warn.conflicts = F)
