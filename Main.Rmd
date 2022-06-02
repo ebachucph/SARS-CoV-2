@@ -1,0 +1,1228 @@
+---
+title: "Main"
+author: "Emil Bach"
+date: "2/1/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Function to record runtime of chunks from https://bookdown.org/yihui/rmarkdown-cookbook/time-chunk.html
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      # record the current time before each chunk
+      now <<- Sys.time()
+    } else {
+      # calculate the time difference after a chunk
+      res <- difftime(Sys.time(), now)
+      # return a character string to show the time
+      paste0("Time for chunk, ", options$label, ", to run: ", round(res, 2), " second(s).")
+    }
+  }
+}))
+knitr::opts_chunk$set(echo = TRUE, time_it = TRUE)
+```
+
+## Loading libraries  
+Code chunk below will load the libraries and local functions in ./docs/functions required to run the analysis.
+
+```{r libraries, message=FALSE, warning=FALSE, echo=FALSE, results='hide'}
+# Load libraries
+library(tidyverse, quietly = T, warn.conflicts = F)
+library(Biostrings, quietly = T, warn.conflicts = F)
+library(DECIPHER, quietly = T, warn.conflicts = F)
+library(broom, quietly = T, warn.conflicts = F)
+library(Peptides, quietly = T, warn.conflicts = F)
+library(parallel, quietly = T, warn.conflicts = F)
+library(data.table, quietly = T, warn.conflicts = F)
+library(plyranges, quietly = T, warn.conflicts = F)
+library(reshape2, quietly = T, warn.conflicts = F)
+library(ape, quietly = T, warn.conflicts = F)
+library(ggpubr, quietly = T, warn.conflicts = F)
+library(gridExtra, quietly = T, warn.conflicts = F)
+library(ggnewscale, quietly = T, warn.conflicts = F)
+library(igraph, quietly = T, warn.conflicts = F)
+library(ggnetwork, quietly = T, warn.conflicts = F)
+library(network, quietly = T, warn.conflicts = F)
+library(ggrepel, quietly = T, warn.conflicts = F)
+library(colorspace, quietly = T, warn.conflicts = F)
+library(reshape2, quietly = T, warn.conflicts = F)
+
+# Source scripts in ./docs/functions
+for(f in list.files("./docs/functions", full.names = T)){
+  if(!is_empty(f)) {
+    #writeLines(paste0("Sourcing: ", f,"\n"))
+    tryCatch(suppressMessages(source(f)),
+             finally = {next})
+  }
+}
+
+```
+
+## Loading data  
+This chunk loads the microarray data from the ./data/raw folder together with the required metadata files:
+```{r loading-data, message=FALSE, warning=FALSE, results='hide'}
+# Load raw data and split into lists based on microarray
+data.list <- fread("./data/raw/SARS2 all raw.txt") %>% 
+  list(.) %>% 
+  rep(., 4) %>% 
+  setNames(1:length(.)) %>% 
+  map2(., names(.), ~.x %>% dplyr::select(c(1:5, as.integer(.y)+5))) %>% 
+  setNames(unlist(map(., ~names(.x)[ncol(.x)]))) %>% 
+  map2(., names(.), ~.x %>% dplyr::rename(Signal := !!.y))
+```
+
+```{r loading-metadata, message=FALSE, warning=FALSE, results='hide'}
+# Load metadata
+complete.map <- fread("./data/Protein complete map.txt")
+```
+
+```{r clean-data, message=FALSE, warning=FALSE, results='hide'}
+# Clean the microarray data
+## Keep only relevant columns for analysis, rename to match 'complete.map', and join with 'complete.map'
+data.list.clean <- data.list %>% 
+  map2(., names(.), ~{
+    .x %>% 
+      dplyr::select(Coresequence, Signal, Group) %>% 
+      setNames(., tolower(names(.))) %>% 
+      .[, signal := ifelse(signal < 0, NA, signal)] %>% 
+      mutate(name = .y)
+  })
+
+# Save cleaned data in ./data/clean
+if(!dir.exists("./data/clean")) { dir.create("./data/clean") }
+
+data.list.clean %>% 
+  map2(., names(.), ~fwrite(.x, file.path("./data/clean", paste0(.y, ".txt"))))
+
+# Remove data to clear space
+rm(list = c("data.list"))
+
+```
+
+
+```{r data-normalization, message=FALSE, warning=FALSE, results='hide'}
+# Load clean data
+if(!"data.list.clean" %in% ls()){
+  data.list.clean <- list()
+  append2list(data.list.clean, list.files(path = "./data/clean", full.names = T), fread, key = "coresequence")
+  data.list.clean <- setNames(data.list.clean, str_remove(basename(names(data.list.clean)), ".txt"))
+}
+
+# Make folder ./data/analysed to save analysed data
+if(!dir.exists("./data/norm")) { dir.create("./data/norm") }
+
+# Normalize the data and calculate probability of being in background ECDF
+### Resulting value for each peptide will called 'p.value'
+data.list.clean.norm <- data.list.clean %>% 
+  mclapply(., function(x) {
+    x[,.(
+      mean_signal = mean(signal, na.rm = T),
+      sd_signal = sd(signal, na.rm = T),
+      n_pep = sum(!is.na(signal)),
+      N = .N,
+      group = unique_combine(group),
+      name = unique(name)
+    ), keyby = .(coresequence)
+    ] %>% 
+      filter(complete.cases(.)) %>% 
+      .[, norm_signal := mean_signal - median(mean_signal[str_detect(group, "random")], na.rm = T)] %>%
+      .[, norm_signal := ifelse(norm_signal < 0, 0, norm_signal) + 1] %>%
+      .[, cv_signal := sd_signal/mean_signal] %>%
+      .[, p.value := my_ecdf(norm_signal[str_detect(group, "random")])(norm_signal)] %>% 
+      .[, scale_signal := norm_signal/max(norm_signal)]
+  },
+  mc.cores = length(data.list.clean))
+
+# Write to ./data/norm
+data.list.clean.norm %>%
+  map2(., names(.), ~fwrite(.x, file.path("./data/norm", paste0(.y,".txt"))))
+
+# Remove data to clear space
+rm(list = c("data.list.clean"))
+
+```
+
+```{r data-analysis, message=FALSE, warning=FALSE, results='hide'}
+# Load normalized data
+if(!"data.list.clean.norm" %in% ls()){
+  data.list.clean.norm <- list()
+  append2list(data.list.clean.norm, list.files(path = "./data/norm", full.names = T), fread, key = "coresequence")
+  data.list.clean.norm <- setNames(data.list.clean.norm, str_remove(basename(names(data.list.clean.norm)), ".txt"))
+}
+
+# Make folder ./data/analysed to save analysed data
+if(!dir.exists("./data/analysed")) { dir.create("./data/analysed") }
+
+# Perform analysis with Fisher's Combined Probability test on P(in background) for peptides overlapping >= 11 in parent protein
+## Resulting value for each peptide will be called 'q.value' 
+data.list.clean.norm.analysed <- mclapply(data.list.clean.norm, function(dt){
+    merge(complete.map, dt, by = "coresequence")[, `:=`(
+      seqnames = prot_name,
+      width = nchar(coresequence),
+      end = NULL
+    )] %>% 
+      .[, overlap_windows(.SD, 11, "p.value", "q.value", fishers_method), by = .(prot_name)]
+  }, mc.cores = length(data.list.clean.norm))
+
+# Write to ./data/analysed
+data.list.clean.norm.analysed %>%
+  map2(., names(.), ~fwrite(.x, file.path("./data/analysed", paste0(.y,".txt"))))
+
+# Remove data to clear space
+rm(list = c("data.list.clean.norm"))
+
+```
+
+## Calculate Shannon Entropy
+### Get high quality sequences from GISAID
+```{r filter-gisaid}
+# Load GISAID metadata
+gisaid_meta <- fread("./data/gisaid/metadata_tsv_2022_02_21/metadata.tsv", sep = "\t", nThread = 8)
+
+# Filter on relevant columns
+gisaid_meta_f <- gisaid_meta %>% 
+  filter(`Is complete?`) %>% 
+  filter(`Is high coverage?`) %>% 
+  filter(is.na(`Is low coverage?`)) %>% 
+  filter(Host == "Human") %>% 
+  filter(is.na(`Is reference?`)) %>% 
+  filter(Type == "betacoronavirus")
+
+## Get the reference sequence in the GISAID database
+gisaid_meta_ref <- gisaid_meta %>% filter(`Is reference?`)
+
+# Write the filtered metadata to a text file to filter fasta with seqkit
+gisaid_meta_f %>%
+  distinct(`Virus name`, `Collection date`, `Submission date`) %>% 
+  unite(., "name", 1:3, sep = "|") %>% 
+  fwrite(., "./data/gisaid/keep_list.txt", col.names = F)
+
+# Write the reference sequence from Wuhan to a separate text file to filter with seqkit
+gisaid_meta_ref %>%
+  distinct(`Virus name`, `Collection date`, `Submission date`) %>% 
+  unite(., "name", 1:3, sep = "|") %>% 
+  fwrite(., "./data/gisaid/reference.txt", col.names = F)
+```
+
+```{r variant-mutations}
+# Load transcribed mutations from https://github.com/aglabx/omicronic
+variant_mutations <- fread("./data/omicron/omicron_mutations.txt")
+
+# Split mutation notation and gather variants sharing mutations
+variant_mutations <- variant_mutations %>% 
+  pivot_longer(., starts_with("BA"), names_to = "Variant", values_to = "Present") %>% 
+  filter(Present == 1) %>% 
+  group_by(Protein, Mutation) %>% 
+  summarise(Variants = ifelse(length(Variant) > 3, "All", 
+                              unique_combine(sort(Variant)))) %>% 
+  mutate(Before = str_extract(Mutation, "^[A-z]+(?=[0-9])"),
+         After = str_extract(Mutation, "(?<=[0-9])[A-z]+$")) %>% 
+  mutate(pstart = str_extract(Mutation , "[0-9]+(?=-|[A-z])")) %>% 
+  mutate(pend = ifelse(str_detect(Mutation, "-"), 
+                      str_extract(Mutation, "(?<=-)[0-9]+"),
+                      pstart))
+
+
+```
+
+
+### Use seqkit to filter fasta files
+Provide the path for the gisaid folder
+```{r set-bash-home}
+Sys.setenv(gisaid = "./data/gisaid")
+```
+
+Get reference sequence from GISAID fasta
+```{zsh gisaid-extract-tar, engine.opts='-i', results=FALSE}
+tar -xf $gisaid/*.xz -C $gisaid
+
+```
+
+Extract the reference sequence and keep in separate fasta.
+Filter gisaid sequences with fasta headers in keep_list.txt
+Remove duplicated sequences in sequences_f.fasta
+Remove duplicated sequences in sequences_f.fasta
+```{zsh gisaid-filter, engine.opts='-i', results=FALSE}
+seqkit grep -n -j 8 -f $gisaid/reference.txt $gisaid/sequences.fasta -o $gisaid/reference.fasta &&
+
+seqkit grep -n -j 8 -f $gisaid/keep_list.txt $gisaid/sequences.fasta -o $gisaid/sequences_f.fasta &&
+
+touch $gisaid/duplicated_nucleotide.txt &&
+seqkit rmdup -s -j 8 -o $gisaid/sequences_f_clean.fasta $gisaid/sequences_f.fasta &> $gisaid/duplicated_nucleotide.txt &&
+
+rm $gisaid/sequences.fasta $gisaid/sequences_f.fasta
+```
+
+Align GISAID sequences
+```{zsh align-gisaid, engine.opts='-i', results=FALSE}
+mkdir -p $gisaid/output > /dev/null 2>&1 &&
+nextalign -i $gisaid/sequences_f_clean.fasta \
+-j 12 \
+--include-reference \
+-g ORF1a,ORF1b,S,ORF3a,ORF3b,E,M,ORF6,ORF7a,ORF7b,ORF8,N,ORF9a,ORF9b \
+-m $gisaid/nextalign_sars2_genemap.gff \
+--nuc-mismatches-allowed 6 \
+-r $gisaid/reference.fasta \
+-o $gisaid/output/sequences_aligned.fasta \
+-d $gisaid/output &> $gisaid/output/unaligned_sequences.txt
+```
+
+Remove stop codons and replace gaps with X and write to new fasta file
+```{zsh protein-cleanup, engine.opts='-i', results=FALSE}
+touch $gisaid/duplicated_proteins.txt
+for file in $gisaid/output/*gene*(.); 
+do
+	g=${file##*gene.}
+	p=$file:h
+	echo "$g"
+	seqkit replace -s -j 8 -p "\*" -r "" $file | seqkit replace -s -j 8 -p "-" -r "X" -o "$p/../protein/$g"
+	seqkit rmdup -s -j 8 -o "$p/../unique/$g" "$p/../protein/$g"
+done &> $gisaid/duplicated_proteins.txt
+
+```
+
+```{r calculate-shannon-entropy, message=FALSE, warning=FALSE}
+# Get fasta file paths
+aligns <- list.files("./data/gisaid/unique", full.names = T)
+
+# Check if out dirs exist, otherwise create them
+dirs <- c("./data/entropy", "./data/entropy_x", "./data/gisaid/standard")
+for (d in dirs) {
+  if(!dir.exists(d)) dir.create(d)
+}
+
+# Filter the protein sequences for standard length and X freq < 0.05
+for(fs in aligns){
+  # Show progress
+  # print(paste0("Running: ", fs))
+  cds <- readBStringSet(fs)
+  
+  # Check distribution of lengths and keep the most common length as standard
+  seq_lengths <- lengths(cds)
+  seq_lengths_dist <- table(seq_lengths)
+  
+  nonstd <- cds[seq_lengths != as.numeric(names(which.max(seq_lengths_dist)))]
+  std <- cds[seq_lengths == as.numeric(names(which.max(seq_lengths_dist)))]
+  
+  # Check X frequency in each sequence
+  std_f <- std[as.vector(letterFrequency(std, "X", as.prob = T) <= 0.05)]
+  
+  std_f_lengths <- data.frame(gene = str_extract(basename(fs), "^.*?(?=\\.)"),
+                              Count = length(std_f)) %>% 
+    rbind(std_f_lengths, .)
+  
+  # Write the standard and filtered sequences to new fasta
+  writeXStringSet(std_f, filepath = file.path("./data/gisaid/standard", basename(fs)), format = "fasta")
+}
+
+# Reload the filtered fasta files
+aligns_f <- list.files("./data/gisaid/standard", full.names = T)
+
+# Calculate shannon entropy on chunks and combine by taking mean of each AA in each position
+for (fs in aligns_f) {
+  # Show progress
+  # print(paste0("Running: ", fs))
+  # Read the fasta file
+  cds <- readBStringSet(fs)
+  len <- unique(lengths(cds))
+  
+  # Split the fasta file into the chunks calculated in std_f_lengths
+  current_gene <-  str_extract(basename(fs), ".*?(?=\\.)")
+  
+  # Count AA occurences in each position of protein with X as ambiguous
+  position_counts <- seq(len) %>% 
+        split_n(., 8) %>% 
+        mclapply(., function(x){
+          map(x, ~{
+            extractAt(cds, IRanges(.x, width = 1)) %>% 
+              unlist() %>% 
+              as.vector(.) %>% 
+              table(factor(., levels = c(AA_STANDARD, "X"), ordered = T)) %>% 
+              colSums(.) %>% 
+              matrix(., ncol = 1, dimnames = list(names(.), .x))
+          }) %>% 
+            do.call("cbind", .)
+        }, mc.cores = length(.)) %>% 
+        do.call("cbind", .) %>% 
+        .[, order(as.integer(colnames(.)))]
+  
+  # Calculate position entropy
+  position_freqs <- position_counts %>% 
+    .[-nrow(.), 1:ncol(.), drop = F] %>% 
+    apply(., 2,function(x) x/sum(x))
+  position_entropy <- apply(position_freqs, 2, function(x) -sum(x * log2(x), na.rm = T))
+  
+  # Write gene-wise entropy to separate files
+  as.data.frame(position_entropy) %>% 
+    rownames_to_column(., "position") %>% 
+    fwrite(., paste0("./data/test_entropy/", str_extract(basename(fs), "^.*?(?=\\.)"), ".txt"))
+  
+  # Calculate position entropy with X
+  position_freqs <- apply(position_counts, 2,function(x) x/sum(x))
+  position_entropy <- apply(position_freqs, 2, function(x) -sum(x * log2(x), na.rm = T))
+  
+  # Write gene-wise entropy to separate files
+  as.data.frame(position_entropy) %>% 
+    rownames_to_column(., "position") %>% 
+    fwrite(., paste0("./data/test_entropy_x/", str_extract(basename(fs), "^.*?(?=\\.)"), ".txt"))
+}
+```
+
+## Figures/tables
+
+```{r figure-settings, message=FALSE, warning=FALSE}
+# Set figure widths according to journal guidelines
+## 1 column -> 75 mm
+width1 <- 75
+
+## 2 columns -> 15 mm
+width2 <- 150
+
+## Figure text -> 8 pt
+text_size <- 8
+```
+
+
+### Pre-analysis
+
+```{r reload-data, message=FALSE, warning=FALSE}
+# Load data
+data.clean.norm <- list.files("./data/norm", full.names = T) %>% 
+  map(., fread) %>% 
+  rbindlist(.) %>% 
+  filter(complete.cases(.)) %>% 
+  filter(!str_detect(group, "UNUSED|MARKER|EMPTY|CONTROL")) %>% # Remove irrelevant fields
+  mutate(pep_group = ifelse(str_detect(group, "random"), "Random", "Test"), # Rename peptide groups
+         patient_group = ifelse(str_detect(name, "Covid"), "SARS2", "HC"), # Make patient group
+         ig_type = str_extract(name, "(?<= )Ig.$")) # Assign Ig-type
+
+```
+
+```{r design-count, message=FALSE, warning=FALSE}
+# Count the number of unique peptide sequences from each organism
+design_count <- complete.map %>% 
+  filter(complete.cases(.)) %>% 
+  filter(str_detect(org, "EBOV", T)) %>% 
+  mutate(table_org = paste0(organism, " (", org,")")) %>% 
+  distinct(coresequence, table_org) %>% 
+  rbind(., data.frame(coresequence = unique(.$coresequence), table_org = "Total")) %>% 
+  count(table_org)
+
+# Write table to txt
+fwrite(design_count, "./images/publication/design_count.txt", sep = "\t")
+rm(list = "design_count")
+```
+
+
+```{r signal-distributions, message=FALSE, warning=FALSE}
+# Make plot
+f.suppl1 <- data.clean.norm %>% 
+  group_by(pep_group, patient_group, ig_type) %>% 
+  mutate(outlier = log2(norm_signal) > quantile(log2(norm_signal), 0.75) + 1.5 * IQR(log2(norm_signal))) %>%
+  ungroup() %>% 
+  ggplot(., aes(x = ig_type, y = norm_signal, fill = pep_group)) +
+  geom_boxplot(outlier.shape = NA, color = "grey50") +
+  geom_point(data = function(x) dplyr::filter_(x, ~ outlier),
+             position = position_jitterdodge(jitter.width = 0.3), shape = 21,
+             color = "grey50", alpha = 0.3) +
+  scale_y_continuous(trans = "log2", limits = c(1, 256), breaks = 2^(0:8)) +
+  scale_fill_manual(values = c("Test" = "orange", "Random" = "black")) +
+  facet_wrap(~patient_group) +
+  labs(x = "Ig-type", y = "Normalized Signal", fill = "Peptide Group") +
+  theme_pubr(base_size = text_size) + 
+  theme(panel.grid.major.y = element_line(),
+        strip.text = element_text(face = "bold"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(face = "bold"),
+        axis.title.y = element_text(face = "bold"),
+        legend.title = element_text(face = "bold"))
+
+# Save plot
+ggsave("./images/publication/supplementary_figure1.svg", f.suppl1, width = width2, height = width1, units = "mm", device = "svg")
+
+# Clear space in environment
+rm(list = c("data.clean.norm", "f.suppl1"))
+
+```
+
+### Post-analysis
+```{r reload-analysed-data, message=FALSE, warning=FALSE}
+# Load analysed data
+data.analysed <- list.files("./data/analysed", full.names = T) %>% 
+  map(., fread) %>% 
+  rbindlist(.) %>% 
+  filter(!is.na(prot_name)) %>% 
+  mutate(patient_group = str_extract(name, "^.*?(?= Ig)"), # Make patient group
+         ig_type = str_extract(name, "(?<= )Ig.$")) %>%  # Assign Ig-type
+  filter(!str_detect(org, "EBOV")) %>% 
+  mutate(Response = q.value <= 0.001 & scale_signal >= 0.2)
+```
+
+```{r response-distributions, message=FALSE, warning=FALSE}
+# Make plot
+f.suppl2 <- data.analysed %>% 
+  distinct(coresequence, patient_group, ig_type, Response, norm_signal) %>% 
+  group_by(patient_group, ig_type, Response) %>% 
+  mutate(outlier = log2(norm_signal) > quantile(log2(norm_signal), 0.75) + 1.5 * IQR(log2(norm_signal))) %>%
+  ungroup() %>% 
+  {
+    ggplot(., aes(x = ig_type, y = norm_signal, fill = Response)) +
+    geom_boxplot(outlier.shape = NA, color = "grey50") +
+    geom_point(data = . %>% mutate(norm_signal = ifelse(outlier, norm_signal, NA)),
+               position = position_jitterdodge(jitter.width = 0.3), shape = 21,
+               color = "grey50", alpha = 0.3) +
+    scale_y_continuous(trans = "log2", limits = c(1, 256), breaks = 2^(0:8)) +
+    scale_fill_manual(values = c("FALSE" = "black", "TRUE" = "orange")) +
+    facet_wrap(~patient_group) +
+    labs(x = "Ig-type", y = "Normalized Signal", fill = "Repsonse") +
+    theme_pubr(base_size = text_size) + 
+    theme(panel.grid.major.y = element_line(),
+          strip.text = element_text(face = "bold"),
+          axis.title.x = element_blank(),
+          axis.text.x = element_text(face = "bold"),
+          axis.title.y = element_text(face = "bold"),
+          legend.title = element_text(face = "bold"))
+  }
+
+# Save plot
+ggsave("./images/publication/supplementary_figure2.svg", f.suppl2, width = width2, height = width1, units = "mm", device = "svg")
+
+# Clear space in environment
+rm(list = "f.suppl2")
+```
+
+```{r response-count, message=FALSE, warning=FALSE}
+# Get distinct responses across patient_group:ig_type
+distincts <- data.analysed %>% 
+  filter(str_detect(org, "EBOV", T)) %>% 
+  filter(Response) %>% 
+  mutate(name = paste(ig_type, patient_group)) %>% 
+  distinct(name, org, coresequence)
+
+# Count distinct responses per organism grouped by ig_type:patient_group
+distincts_org.name <- distincts %>% 
+  count(org, name) %>% 
+  pivot_wider(., id_cols = "org", names_from = "name", values_from = "n") %>% 
+  rbind(., distincts %>% 
+  distinct(name, coresequence) %>% 
+  count(name) %>% 
+  mutate(org = "Total") %>% 
+  pivot_wider(., id_cols = "org", names_from = "name", values_from = "n"))
+
+# Count distinct responses per organism
+distincts_org <- distincts %>% 
+  distinct(org, coresequence) %>% 
+  count(org) %>% 
+  dplyr::rename("All" = "n") %>% 
+  rbind(., distincts %>% 
+  distinct(coresequence) %>% 
+  count() %>% 
+  mutate(org = "Total") %>% 
+  dplyr::rename("All" = "n"))
+
+# Combine the counts
+peptide_response_table <- cbind(distincts_org.name, distincts_org)
+
+# Write the table
+fwrite(peptide_response_table, "./images/publication/peptide_response_table.txt", sep = "\t")
+
+rm(list = str_subset(ls(), "distincts|peptide_response_table"))
+```
+
+### Peptide and response networks
+
+```{r background-network, message=FALSE, warning=FALSE}
+# Get unique peptides for each organism and calculate Jaccard distances between organisms
+complete_pairwise_distances <- complete.map %>% 
+  distinct(coresequence, org) %>% 
+  filter(!str_detect(org, "EBOV")) %>% 
+  split(., .$org) %>% 
+  map(., ~unique(.x$coresequence)) %>% 
+  pairwise_jaccard(.) %>% 
+  rbind(., dplyr::select(., "Col" = Row, "Row" = Col, Distance))
+
+complete_pairwise_distances_matrix <- complete_pairwise_distances %>% 
+  dcast(., Row~Col, fill = 1, value.var = "Distance", fun.aggregate = unique) %>% 
+  column_to_rownames(., "Row") %>% 
+  as.matrix.data.frame()
+
+diag(complete_pairwise_distances_matrix) <- 0
+
+complete_pairwise_similarity_matrix <- 1 - complete_pairwise_distances_matrix
+
+cormat <- ggcorrplot::ggcorrplot(complete_pairwise_similarity_matrix*100, 
+                                 hc.order = T, 
+                                 hc.method = "complete", 
+                                 outline.color = "black", 
+                                 type = "lower")
+
+f1 <- cormat$data %>% 
+  ggplot(., aes(x = Var1, y = Var2, fill = value, label = format(round(value, 2), nsmall = 2))) +
+  geom_tile(color = "black") +
+  scale_fill_gradient2(limit = c(0, 100), low = "blue", 
+                       mid = "orange",
+                       high = "red", midpoint=50) + 
+  geom_text(size = 6 / (14/5)) +
+  labs(fill = "Jaccard\nSimilarity (%)") +
+  theme_minimal(base_size = text_size) +
+  theme(axis.title = element_blank(),
+        axis.text.x = element_text(angle = 60, hjust = 1)) +
+  coord_fixed()
+
+# Save plot
+ggsave("./images/publication/figure1.svg", f1, device = "svg", width = width2, height = width1, units = "mm")
+```
+
+```{r response-network, message=FALSE, warning=FALSE}
+# Get the positive peptides q.value <= 0.001
+response_sets <- data.analysed %>% 
+  filter(Response) %>% 
+  split(., list(.$patient_group, .$ig_type, .$org), sep = " ") %>% 
+  map(., ~unique(.x$coresequence))
+
+pair_dists <- response_sets %>% 
+  pairwise_jaccard(.) %>% 
+  rbind(., dplyr::select(., "Col" = Row, "Row" = Col, Distance))
+
+pair_dists_matrix <- pair_dists %>% 
+  dcast(., Row~Col, fill = 1, value.var = "Distance", fun.aggregate = unique) %>% 
+  column_to_rownames(., "Row") %>% 
+  as.matrix.data.frame()
+
+diag(pair_dists_matrix) <- 0
+pair_sim_matrix <- 1 - pair_dists_matrix
+```
+
+
+```{r response-network-igraph, message=FALSE, warning=FALSE}
+# Create the graph adjacency object based on the Jaccard distances
+network.graph <- graph.adjacency(pair_sim_matrix,
+                                 mode = "undirected",
+                                 weighted = T, diag = F)
+
+## Simplify the adjacency object
+network.graph <- simplify(network.graph, remove.multiple=TRUE, remove.loops=TRUE)
+
+## Remove edges with distance == 1 and convert distance to similarity
+network.graph <- delete_edges(network.graph, E(network.graph)[which(E(network.graph)$weight==0)])
+
+## Scale the weight of edges for the width of the edges in plot
+edgeweights <- E(network.graph)$weight * 30
+
+## Set fill and frame color for vertexes based on serum pool and Ig-type
+V(network.graph)$color <- ifelse(str_detect(names(V(network.graph)), "SARS2"),"dodgerblue1", "firebrick2")
+
+## Set vertex names/labels to just the organism
+V(network.graph)$names <- str_trim(str_extract(names(V(network.graph)), "(?<=gA|G ).*?$"))
+
+```
+
+
+```{r network-plots, message=FALSE, warning=FALSE}
+# Generate plot of overall network
+network.all <- ggnetwork(network.graph, layout = layout_with_fr(network.graph)) %>% 
+  mutate(n = lengths(response_sets)[name]) %>% 
+  # mutate(scale = scale01(n)) %>% 
+  mutate(group = str_extract(name, "^.*? .*?(?= )")) %>% 
+  {
+    edges <- filter(., !is.na(weight))
+    nodes <- filter(., is.na(weight))
+  ggplot() +
+    geom_segment(data = edges, aes(x = x, y = y, xend=xend, yend = yend), 
+                 size = 2 * (edges$weight + 0.05), color = "grey40") +
+    geom_point(data = nodes, 
+               aes(x = x, y = y, color = group, fill = group), 
+               shape = 21, stroke = 1.5, size = 10 * sqrt(nodes$n)/sqrt(max(nodes$n))) +
+    # geom_text(data = nodes, aes(x = x, y = y, label = names), size = 10 / (14/5)) + 
+    geom_text_repel(data = nodes, aes(x = x, y = y, label = names), size = text_size / (14/5),
+                    box.padding = 1, max.overlaps = Inf, min.segment.length = 0.25,
+                    color = darken(nodes$color, 0.4), max.time = 5, max.iter = 10^5) +
+    scale_color_manual(values = c("HC IgG" = "grey40", "HC IgA" = "grey70",
+                                  "SARS2 IgG" = "grey40", "SARS2 IgA" = "grey70")) +
+    scale_fill_manual(values = c("HC IgG" = "firebrick2", "HC IgA" = "firebrick2",
+                                  "SARS2 IgG" = "dodgerblue1", "SARS2 IgA" = "dodgerblue1")) +
+    guides(colour = guide_legend(override.aes = list(size=10))) +
+    labs(color = "Serum & Ig-type", fill = "Serum & Ig-type") +
+    theme_blank(base_size = text_size)
+  }
+
+# Generate plot of IgG response network
+network.igg <- network.graph %>% 
+  delete_vertices(., str_detect(names(V(.)), "IgG", negate = T)) %>% 
+  ggnetwork(., layout = layout_with_fr(.)) %>% 
+  mutate(n = lengths(response_sets)[name]) %>% 
+  # mutate(scale = scale01(n)) %>% 
+  mutate(group = str_extract(name, "^.*? .*?(?= )")) %>% 
+  {
+    edges <- filter(., !is.na(weight))
+    nodes <- filter(., is.na(weight))
+  ggplot() +
+    geom_segment(data = edges, aes(x = x, y = y, xend=xend, yend = yend), 
+                 size = 2 * (edges$weight + 0.05), color = "grey40") +
+    geom_point(data = nodes, 
+               aes(x = x, y = y, color = group, fill = group), 
+               shape = 21, stroke = 1.5, size = 10 * sqrt(nodes$n)/sqrt(max(nodes$n))) +
+    # geom_text(data = nodes, aes(x = x, y = y, label = names), size = 10 / (14/5)) + 
+    geom_text_repel(data = nodes, aes(x = x, y = y, label = names), size = text_size / (14/5),
+                    box.padding = 1, max.overlaps = Inf, min.segment.length = 0.25,
+                    color = darken(nodes$color, 0.4), max.time = 5, max.iter = 10^5) +
+    scale_color_manual(values = c("HC IgG" = "grey40", "HC IgA" = "grey70",
+                                  "SARS2 IgG" = "grey40", "SARS2 IgA" = "grey70")) +
+    scale_fill_manual(values = c("HC IgG" = "firebrick2", "HC IgA" = "firebrick2",
+                                  "SARS2 IgG" = "dodgerblue1", "SARS2 IgA" = "dodgerblue1")) +
+    guides(colour = guide_legend(override.aes = list(size=10))) +
+    labs(color = "Serum & Ig-type", fill = "Serum & Ig-type") +
+    theme_blank(base_size = text_size)
+  }
+
+# Generate plot of IgA response network
+network.iga <- network.graph %>% 
+  delete_vertices(., str_detect(names(V(.)), "IgA", negate = T)) %>% 
+  ggnetwork(., layout = layout_with_fr(.)) %>% 
+  mutate(n = lengths(response_sets)[name]) %>% 
+  mutate(group = str_extract(name, "^.*? .*?(?= )")) %>% 
+  {
+    edges <- filter(., !is.na(weight))
+    nodes <- filter(., is.na(weight))
+  ggplot() +
+    geom_segment(data = edges, aes(x = x, y = y, xend=xend, yend = yend), 
+                 size = 2 * (edges$weight + 0.05), color = "grey40") +
+    geom_point(data = nodes, 
+               aes(x = x, y = y, color = group, fill = group), 
+               shape = 21, stroke = 1.5, size = 10 * sqrt(nodes$n)/sqrt(max(nodes$n))) +
+    # geom_text(data = nodes, aes(x = x, y = y, label = names), size = 10 / (14/5)) + 
+    geom_text_repel(data = nodes, aes(x = x, y = y, label = names), size = text_size / (14/5),
+                    box.padding = 1, max.overlaps = Inf, min.segment.length = 0.25,
+                    color = darken(nodes$color, 0.4), max.time = 5, max.iter = 10^5) +
+    scale_color_manual(values = c("HC IgG" = "grey40", "HC IgA" = "grey70",
+                                  "SARS2 IgG" = "grey40", "SARS2 IgA" = "grey70")) +
+    scale_fill_manual(values = c("HC IgG" = "firebrick2", "HC IgA" = "firebrick2",
+                                  "SARS2 IgG" = "dodgerblue1", "SARS2 IgA" = "dodgerblue1")) +
+    guides(colour = guide_legend(override.aes = list(size=10))) +
+    labs(color = "Serum & Ig-type", fill = "Serum & Ig-type") +
+    theme_blank(base_size = text_size)
+  }
+```
+
+```{r shared-response-plots, message=FALSE, warning=FALSE}
+# Combine IgG and IgA network plots
+f2.1 <- ggarrange(plotlist = list(network.igg, network.iga), ncol = 1,
+                                  common.legend = T, legend = "right", labels = "AUTO")
+
+ggsave("./images/publication/figure2.1.svg", f2.1, device = "svg", width = width2, height = width2, units = "mm")
+
+# Combine IgG and IgA network plots
+f2.2 <- network.all
+
+ggsave("./images/publication/figure2.2.svg", f2.2, device = "svg", width = width2, height = width2, units = "mm")
+```
+
+### SARS-CoV-2 proteome-wide response overview
+```{r load-entropy, message=FALSE, warning=FALSE}
+# Load entropy data
+## No X
+entropy <- list.files("./data/unique_entropy", full.names = T) %>% 
+  map(., ~fread(.x) %>% mutate(gene_abbr = str_replace(basename(.x), "\\.txt", ""))) %>% 
+  rbindlist(.) %>% 
+  split(., str_detect(.$gene_abbr, "ORF1")) %>% 
+  map2(., names(.), ~if(.y) {
+    .x %>% 
+      mutate(gene_abbr = "ORF1ab",
+             position = 1:nrow(.)) %>% 
+      rbind(.x %>% filter(gene_abbr == "ORF1a"), .)
+  } else {
+    .x
+  }) %>% 
+  rbindlist(.)
+
+## With X
+entropy_x <- list.files("./data/unique_entropy_x", full.names = T) %>% 
+  map(., ~fread(.x) %>% mutate(gene_abbr = str_replace(basename(.x), "\\.txt", ""))) %>% 
+  rbindlist(.) %>% 
+  split(., str_detect(.$gene_abbr, "ORF1")) %>% 
+  map2(., names(.), ~if(.y) {
+    .x %>% 
+      mutate(gene_abbr = "ORF1ab",
+             position = 1:nrow(.)) %>% 
+      rbind(.x %>% filter(gene_abbr == "ORF1a"), .)
+  } else {
+    .x
+  }) %>% 
+  rbindlist(.)
+
+```
+
+```{r prepare-protein-data, message=FALSE, warning=FALSE}
+# Set order of proteins based on start position of gene in SARS-CoV-2 genome
+protein_order <- c("ORF1a", "ORF1ab", "S", "ORF3a", "ORF3b", "E", "M", "ORF6", "ORF7a", "ORF7b", "ORF8", "N", "ORF9a", "ORF9b")
+
+# Get GISAID like names from UniProt
+sars2_feats <- complete.map %>% 
+  distinct(org, prot_name) %>% 
+  mutate(UniProt = str_extract(prot_name, "(?<=\\|).*?(?=\\|)")) %>% 
+  filter(complete.cases(.)) %>% 
+  filter(org == "SARS-CoV-2") %>% 
+  mutate(gene_abbr = get_genename(UniProt))
+
+# Fix names for polyproteins
+sars2_feats$gene_abbr[1:2] <- c("ORF1a", "ORF1ab")
+
+# Fix names for ORF9b->ORF9a and ORF9c->ORF9b
+sars2_feats <- sars2_feats %>% 
+  mutate(gene_abbr = unlist(gene_abbr)) %>% 
+  mutate(gene_abbr = case_when(gene_abbr == "ORF9b" ~ "ORF9a",
+                             gene_abbr == "ORF9c" ~ "ORF9b",
+                             T ~ gene_abbr)) %>% 
+  mutate(gene_abbr = factor(gene_abbr, levels = protein_order, ordered = T))
+
+# Filter Entropy to keep only entries in sars2_feats
+entropy <- entropy_x %>% 
+  left_join(., sars2_feats, by = "gene_abbr") %>% 
+  filter(complete.cases(.)) %>% 
+  mutate(gene_abbr = factor(gene_abbr, levels = protein_order, ordered = T))
+
+# Filter data.analysed with entries in sars2_feats
+data.sars2 <- data.analysed %>% 
+  filter(org == "SARS-CoV-2") %>% 
+  left_join(., sars2_feats, by = intersect(names(sars2_feats), names(data.analysed))) %>% 
+  filter(complete.cases(.)) %>% 
+  mutate(gene_abbr = factor(gene_abbr, levels = protein_order, ordered = T))
+```
+
+```{r sars2-proteome-plot, message=FALSE, warning=FALSE}
+# Set number of AA position per row
+n_rows <- 2000 
+
+# Add the relative position of each peptide
+data.sars2.rel <- data.sars2 %>% 
+  group_by(gene_abbr) %>% 
+  summarise(Ends = max(end)) %>% 
+  filter(complete.cases(.)) %>% 
+  filter(gene_abbr != "ORF1a") %>% 
+  mutate(rel_end = cumsum(Ends)) %>% 
+  mutate(rel_start = (rel_end - Ends)) %>% 
+  mutate(rel_start = ifelse(rel_start > 0, rel_start + 1, rel_start)) %>% 
+  distinct(gene_abbr, rel_start) %>% 
+  left_join(data.sars2, .) %>% 
+  mutate(rel_start = rel_start + start) %>% 
+  mutate(rel_end = rel_start + width - 1) %>% 
+  filter(complete.cases(.)) %>% 
+  arrange(gene_abbr, rel_start) %>% 
+  dplyr::rename("start" = "rel_start", "end" = "rel_end", "pstart" = "start", "pend" = "end")
+
+# Make row breaks based on desired number of AA per row in plot
+sars_rel_ends <- distinct(data.sars2.rel, end) %>% 
+  unlist(., use.names = F)
+row_max <- ceiling(max(sars_rel_ends) / n_rows)
+end_idx <- unlist(lapply(seq(n_rows, n_rows * row_max, n_rows), function(x) which.min(abs(sars_rel_ends - x))))
+row_ends <- c(sars_rel_ends[end_idx])
+row_starts <- c(1,row_ends[-length(row_ends)] + 1)
+row_splits <- IRanges(row_starts, row_ends, names = seq(length(row_starts)))
+
+# Add relative positions and row number to entropy data
+entropy.rel <- entropy %>% 
+  filter(gene_abbr != "ORF1a") %>% 
+  arrange(gene_abbr) %>% 
+  mutate(start = 1:nrow(.), end = 1:nrow(.)) %>% 
+  as_iranges(.) %>% 
+  mergeByOverlaps(., row_splits, type = "within") %>% 
+  as.data.frame(.) %>% 
+  dplyr::select(-contains(".."), -matches("start|end|width")) %>% 
+  dplyr::rename("row" = matches("names")) %>% 
+  mutate(all_position = 1:nrow(.)) %>% 
+  split(., .$row) %>%
+  map2(., names(.), ~if(nrow(.x) >= n_rows) .x else {
+    as.data.table(.x) %>%
+      rbind(., data.table(all_position = seq(max(.x$all_position)+1,
+                                             min(.x$all_position)+(n_rows-1))),
+            fill = T) %>% 
+      mutate(row = as.numeric(.y))
+  }) %>%
+  rbindlist(.) %>%
+  mutate(entropy_scale = 0.05 + position_entropy/(-sum(rep(1/20, 20) * log(rep(1/20, 20)))),
+         ymin = 0.05) %>% 
+  rbind(., mutate(., entropy_scale = -1 * entropy_scale,
+                  ymin = -0.05))
+
+# Map relative positions and row number to omicron variant data
+variant_mutations.rel <- variant_mutations %>% 
+  mutate(gene_abbr = Protein) %>% 
+  mutate_at(vars("pstart", "pend"), as.integer) %>% 
+  left_join(., dplyr::select(entropy.rel, gene_abbr, position, all_position), 
+            by = c("gene_abbr", "pstart" = "position")) %>% 
+  dplyr::rename("start" = "all_position") %>% 
+  left_join(., dplyr::select(entropy.rel, gene_abbr, position, all_position), 
+            by = c("gene_abbr", "pend" = "position")) %>% 
+  dplyr::rename("end" = "all_position") %>% 
+  as_iranges(.) %>% 
+  mergeByOverlaps(., row_splits, type = "within") %>% 
+  as.data.frame(.) %>% 
+  dplyr::rename("rel_start" = "..start", "rel_end" = "..end") %>% 
+  dplyr::select(-contains(".."), -matches("\\.(start|end|width)")) %>% 
+  dplyr::rename("row" = matches("names"), "start" = "pstart", "end" = "pend") %>% 
+  distinct_all(.)
+
+# Add row number to sars2 data and transform scaled signal to be up/down
+plot_data <- data.sars2.rel %>% 
+  dplyr::select(-seqnames) %>% 
+  as_iranges(.) %>% 
+  mergeByOverlaps(., row_splits, type = "within") %>% 
+  as.data.frame(.) %>% 
+  dplyr::rename("rel_start" = "..start", "rel_end" = "..end") %>% 
+  dplyr::select(-contains(".."), -matches("\\.(start|end|width)")) %>% 
+  dplyr::rename("row" = matches("names"), "start" = "pstart", "end" = "pend") %>% 
+  mutate(plot_signal = scale_signal + 0.05) %>% 
+  mutate(plot_signal = ifelse(str_detect(name, "Negative"), -1 * plot_signal, plot_signal),
+         ymin = ifelse(str_detect(name, "Negative"), -0.05, 0.05))
+
+# Make intervals for rectangles showing proteins
+prot_rect <- entropy.rel %>% 
+  group_by(gene_abbr, row) %>% 
+  summarise(pmin = min(all_position), pmax = max(all_position)) %>% 
+  ungroup() %>% 
+  filter(complete.cases(.)) %>% 
+  mutate(ymin = -1.1, ymax = 1.1)
+
+# Create custom breaks for pretty y axis
+breaks <- labeling::extended(0.25, 1, 4)
+breaks_pos <- c(-1 * (rev(breaks) + 0.05), breaks + 0.05)
+breaks <- as.character(c(rev(breaks), breaks))
+
+# Create data frame for text in plot
+text_frame <- plot_data %>% 
+  group_by(row) %>% 
+  summarise(x = min(rel_start)) %>% 
+  mutate(y = 0.9, label = "COVID19") %>% 
+  rbind(., mutate(., y = -0.9, label = "Control"))
+
+# Make plot
+sars2.proteome.plots <- plot_data %>%
+  split(., .$ig_type) %>% 
+  map2(., names(.), ~{
+    # Split microarray data
+    plot_data_n <- filter(.x, !Response)
+    plot_data_p <- filter(.x, Response)
+    
+    #Plot start
+    ggplot() +  #Make empty plot
+      geom_rect(data = prot_rect, # Add protein box background
+                aes(xmin = pmin, xmax = pmax, ymin = ymin, ymax = ymax, fill = gene_abbr), alpha = 0.6, inherit.aes = F) +
+      scale_fill_brewer(palette = "Set3", na.translate = F, 
+                        guide = guide_legend(nrow=1,byrow=TRUE,title = "Protein", 
+                                             title.position = "top", title.hjust = 0.5, 
+                                             keywidth = 0.5, keyheight = 0.5)) + 
+      new_scale_fill() +
+      geom_linerange(data = entropy.rel, aes(x = all_position, ymin = ymin, ymax = entropy_scale)) + # Add entropy
+      geom_rect(data = plot_data_n, aes(xmin = rel_start, xmax = rel_end, # Add negative responses
+                                        ymin = ymin, ymax = plot_signal),
+                alpha = 0.3, inherit.aes = F, fill = "grey50") +
+      geom_rect(data = plot_data_p, aes(xmin = rel_start, xmax = rel_end, # Add positive responses
+                                      ymin = ymin, ymax = plot_signal), 
+                alpha = 0.3, inherit.aes = F, fill = "dodgerblue") +
+      geom_vline(data = variant_mutations.rel, aes(xintercept = rel_start), color = "red", alpha = 0.4) +
+      geom_text(data = text_frame, # Add text to plot
+                aes(x = x, y = y, label = label),
+                inherit.aes = F, hjust = -0.15, size = text_size * (5/14)) +
+      scale_x_continuous(expand = c(0, 0)) +
+      scale_y_continuous(limits = c(-1.1, 1.1), breaks = c(breaks_pos), 
+                         labels = c(breaks), 
+                         expand = c(0,0),
+                         sec.axis = sec_axis(~ . * 1, breaks = c(breaks_pos),
+                                             labels = c(breaks), name = "Relative Entropy")) +
+      facet_wrap(~row, scales = "free_x", ncol = 1) +
+      # labs(x = "AA Position", y = "Scaled Signal", title = .y) +
+      labs(x = "AA Position", y = "Scaled Signal") +
+      theme_pubclean(base_size = text_size) +
+      theme(axis.title = element_text(face = "bold"),
+            legend.title = element_text(face = "bold", size = text_size),
+            legend.position = "top",
+            legend.direction = "horizontal",
+            panel.grid.major.x = element_line(),
+            strip.background = element_blank(),
+            strip.text.x = element_blank())
+  })
+
+```
+
+```{r print-proteome-plots, message=FALSE, warning=FALSE}
+# Print IgG plot
+ggsave("./images/publication/figure3.svg", sars2.proteome.plots$IgG,
+       width = width2, height = width2, units = "mm")
+
+# Print IgA plot
+ggsave("./images/publication/supplementary_figure3.svg", sars2.proteome.plots$IgA,
+       width = width2, height = width2, units = "mm")
+
+```
+
+
+### Individual protein responses
+```{r individual-protein-plots, message=FALSE, warning=FALSE}
+# Make protein plots
+protein_plots <- data.analysed %>% 
+  filter(!is.na(prot_name)) %>% 
+  split(., list(.$prot_name, .$ig_type)) %>% 
+  map(., ~{
+    # Prepare data for plot
+    plot_data <- .x %>% 
+      mutate(plot_signal = norm_signal + 10) %>% 
+      mutate(plot_signal = ifelse(str_detect(name, "Negative"), -1 * plot_signal, plot_signal),
+             ymin = ifelse(str_detect(name, "Negative"), -10, 10))
+    
+    # Create custom breaks for pretty y axis
+    breaks <- labeling::extended(0, 255, 7)
+    breaks_pos <- c(-1 * (rev(breaks) + 10), breaks + 10)
+    breaks <- as.character(c(rev(breaks), breaks))
+    
+    # Make plot title
+    ptitle <- paste(unique(plot_data$prot_name), unique(plot_data$ig_type))
+    
+    # Create plot
+    plot_data %>% 
+      ggplot(., aes(xmin = start, xmax = end, ymin = ymin, ymax = plot_signal)) +
+      geom_rect(aes(fill = q.value <= 0.001), alpha = 0.6) +
+      geom_text(data = data.frame(x = 0, 
+                                  y = c(-285, 285), 
+                                  label = c("Healthy Control","SARS2 Positive")),
+                aes(x = x, y = y, label = label), 
+                inherit.aes = F, hjust = 0, size = 9 * (5/14)) +
+      scale_x_continuous(expand = c(0, 0)) +
+      scale_y_continuous(limits = c(-305, 305), breaks = c(breaks_pos), 
+                         labels = c(breaks), 
+                         expand = c(0,0)) +
+      labs(x = "AA Position", y = "Signal",title = ptitle, fill = "Response") +
+      theme_pubclean() +
+      guides(fill = guide_legend(title.position="top", title.hjust = 0)) +
+      theme(axis.title = element_text(face = "bold"),
+            legend.title = element_text(face = "bold", size = 12),
+            legend.position = "bottom",
+            panel.grid.major.x = element_line(),
+            title = element_text(size = 8))
+      })
+
+# Create order vector for the protein plots
+protein_order <- data.analysed %>% 
+  group_by(prot_name, ig_type, patient_group) %>% 
+  summarise(mean_response = sum(q.value <= 0.001) / unique(prot_length),
+            id = unique(id),
+            short_name = unique(short_name),
+            full_name = unique(full_name),
+            organism = unique(organism)) %>% 
+  ungroup() %>% 
+  group_split(ig_type, patient_group) %>% 
+  map(., ~.x %>% arrange(desc(mean_response))) %>% 
+  rbindlist(.) 
+
+protein_examples <- protein_order %>% 
+  .[, .SD[which.max(mean_response)], by = c("organism", "ig_type")] %>% 
+  mutate(list_name = paste(prot_name, ig_type, sep = ".")) %>% 
+  split(., .$ig_type) %>% 
+  map(., ~.x %>% arrange(organism) %>% dplyr::select(list_name) %>% unlist()) %>% 
+  map(., ~protein_plots[.x] %>% map(., ~.x + theme(axis.title = element_blank()))) %>% 
+  map(., ~.x %>% 
+        ggarrange(plotlist = ., nrow = 4, ncol = 4, common.legend = T, 
+                  legend = "bottom") %>% 
+        annotate_figure(., bottom = "AA Position", left = "Signal"))
+
+spike_examples <- data.analysed %>% 
+  filter(grepl("spike" , full_name, ignore.case = T)) %>% 
+  distinct(organism, prot_name, ig_type) %>% 
+  mutate(list_name = paste(prot_name, ig_type, sep = ".")) %>% 
+  split(., .$ig_type) %>% 
+  map(., ~.x %>% arrange(organism) %>% dplyr::select(list_name) %>% unlist()) %>% 
+  map(., ~protein_plots[.x] %>% 
+        map(., ~.x + theme(axis.title = element_blank())) %>% 
+        ggarrange(plotlist = ., nrow = 3, ncol = 3, common.legend = T, 
+                  legend = "bottom") %>% 
+        annotate_figure(., bottom = "AA Position", left = "Signal"))
+
+
+```
+
+### Response sequence summary
+```{r response-sequence-summary}
+# Filter for responses and merge peptide intervals within protein and group
+intersect_v <- Vectorize("intersect", vectorize.args = "y")
+
+# Combine overlapping response peptides into a response region, then find response regions with matching peptides
+response_intervals <- data.analysed %>% 
+  filter(Response) %>% 
+  filter(str_detect(prot_name, "R1A_", T)) %>% 
+  unite(., col = "ID", org, id, prot_name, ig_type, patient_group, remove = F, sep = ".") %>% 
+  split(., .$ID) %>% 
+  keep(., ~nrow(.x) > 0) %>% 
+  compact(.) %>% 
+  map(.,~{
+    q <- .x %>% 
+      dplyr::select(start, end, scale_signal) %>% 
+      as_iranges(.) %>% 
+      reduce_ranges(AUC = sum(scale_signal), N = n())
+        
+    s <- .x %>% 
+      dplyr::select(start, end, "peptides" = coresequence) %>% 
+      as_iranges(.)
+    
+    mergeByOverlaps(s,q) %>% 
+      as.data.frame(.) %>% 
+      dplyr::select(starts_with("q"), s.peptides) %>% 
+      rename_all(., ~str_remove(.,"^[qs]\\.")) %>%
+      mutate(prot_name = unique(.x$prot_name)) %>% 
+      mutate_if(is.list, ~unique(unlist(.))) %>% 
+      rowwise(.) %>%
+      mutate(prot_seq = as.character(extractAt(fasta[[prot_name]], IRanges(start,end)))) %>%
+      ungroup(.) %>%
+      group_by(prot_seq) %>%
+      summarise_all(., ~list(unique(.))) %>%
+      mutate_at(vars(-peptides), unlist)
+  }) %>% 
+  rbindlist(., idcol = "ID") %>%
+  unite(.,col = "ID", ID, start, end, sep = ".") %>% 
+  rowwise(.) %>% 
+  mutate(matches = list(.$ID[
+    lengths(intersect_v(peptides, .$peptides))>0
+  ]))
+
+# Create alignments of matching response intervals
+response_alignments <- response_intervals$matches %>% 
+  .[!duplicated(.)] %>% 
+  map(., ~{
+    temp <- response_intervals %>% 
+      filter(ID %in% .x)
+    
+    seqs <- temp$prot_seq
+    names(seqs) <- temp$ID
+    if(length(seqs) > 1){
+      out <- AlignSeqs(AAStringSet(seqs, use.names = T))
+    } else {
+      out <- AAStringSet(seqs, use.names = T)
+    }
+    as.data.frame(out) %>% 
+      rownames_to_column("ID")
+    }) %>% 
+  rbindlist(., idcol = "align_id") %>% 
+  separate(., ID, 
+           into =  c("org", "id", "prot_name", "ig_type", "patient_group","start","end"), 
+           sep = "\\.") %>% 
+  group_split(align_id) %>% 
+  map(., ~ .x %>% arrange(desc(str_count(x, "[^-]")))) %>% 
+  rbindlist(.)
+
+# Add gene_abbr to alignments
+response_alignments <- response_alignments %>% 
+  left_join(., distinct(complete.map, prot_name, gene_abbr)) %>% 
+  mutate(start = as.integer(start), end = as.integer(end))
+
+# Add omicron mutations and mean entropy to SARS-CoV-2 responses
+mut_ent_map <- response_alignments %>% 
+  filter(org == "SARS-CoV-2") %>% 
+  distinct(gene_abbr) %>% 
+  unlist(.) %>% 
+  map(., ~{
+    ent <- entropy_x %>% filter(gene_abbr == .x) %>% 
+      mutate(start = position, width = 1) %>% 
+      dplyr::select(start, width, position_entropy) %>% 
+      as_iranges(.)
+    
+    mut <- variant_mutations %>% filter(Protein == .x) %>% 
+      mutate(start = as.integer(pstart), end = as.integer(pend)) %>% 
+      dplyr::select(start, end, Mutation, Variants) %>% 
+      as_iranges(.)
+    
+    als <- response_alignments %>% 
+      filter(org == "SARS-CoV-2") %>% 
+      filter(gene_abbr == .x) %>% 
+      mutate(start = as.integer(start), end = as.integer(end)) %>% 
+      as_iranges(.)
+    
+    temp.mut <- mergeByOverlaps(als, mut) %>% 
+      as.data.frame(.) %>% 
+      dplyr::rename("start" = "als.start", "end" = "als.end") %>% 
+      select_at(vars(-contains("."))) %>% 
+      dplyr::select(-Protein)
+    
+    temp.ent <- mergeByOverlaps(als, ent) %>% 
+      as.data.frame(.) %>% 
+      dplyr::rename("start" = "als.start", "end" = "als.end") %>% 
+      select_at(vars(-contains(".")))
+    
+    full_join(temp.mut, temp.ent, intersect(names(temp.mut), names(temp.ent))) %>% 
+      group_by_at(vars(-position_entropy)) %>% 
+      summarise_all(list(Mean = mean, SD = sd))
+  }) %>% 
+  rbindlist(.)
+
+# Add mutation and entropy info
+response_alignments <- left_join(response_alignments, 
+                                 mut_ent_map, 
+                                 intersect(names(response_alignments), 
+                                           names(mut_ent_map))) %>% 
+  dplyr::select(-c("start", "end", "x"),start,end,x, -prot_name) %>% 
+  group_by_at(vars(-Mutation, -Variants)) %>% 
+  summarise_all(~paste(., sep = "; ", collapse = "; ")) %>% 
+  dplyr::select(union(c("align_id", "org", "id", "gene_abbr", "ig_type", "patient_group", "Mutation", "Variants"), names(.))) %>% 
+  as.data.table(.)
+
+# Write individual tables
+## SARS-CoV-2 alignments
+response_alignments %>% 
+  .[,if(any(org == "SARS-CoV-2")) .SD, by = "align_id"] %>% 
+    .[, arrange(.SD, desc(str_count(x, "[A-Z]"))), by = "align_id"] %>% 
+  mutate_at(vars(Mutation, Variants), ~ifelse(. == "NA", NA, .)) %>% 
+  fwrite(., "./images/publication/sars-cov-2_all_aligns.txt", sep = "\t", dec = ",")
+
+## All Coronaviridae alignments
+response_alignments %>% 
+  .[,if(all(org != "HCMV")) .SD, by = "align_id"] %>% 
+  .[, arrange(.SD, desc(str_count(x, "[A-Z]"))), by = "align_id"] %>% 
+  mutate_at(vars(Mutation, Variants), ~ifelse(. == "NA", NA, .)) %>% 
+  fwrite(., "./images/publication/coronaviridae_aligns.txt", dec = ",", sep = "\t")
+
+## HCMV alignments
+response_alignments %>% 
+  .[,if(all(org == "HCMV")) .SD, by = "align_id"] %>% 
+  .[, arrange(.SD, desc(str_count(x, "[A-Z]"))), by = "align_id"] %>% 
+  dplyr::select(-c("Mutation", "Variants", "Mean", "SD")) %>% 
+  fwrite(., "./images/publication/hcmv_aligns.txt", sep = "\t", dec = ",")
+
+
+```
+
+```{r intersection-matrix}
+# Get counts of identical peptides between groupings
+get_lower_tri <- function(cormat) {
+  cormat[upper.tri(cormat)] <- NA 
+  return(cormat)
+} 
+
+# Find pairwise intersections between response sets
+cormat <- data.analysed %>% 
+  filter(Response) %>% 
+  unite(., col = "ID",patient_group, ig_type, org, sep = " ") %>% 
+  dplyr::distinct(ID, coresequence) %>%
+  split(., .$ID) %>% 
+  map(., ~.x$coresequence) %>% 
+  outer(.,., FUN = Vectorize("intersect", SIMPLIFY = F, USE.NAMES = T)) %>% 
+  lengths(.) %>% 
+  ggcorrplot::ggcorrplot(., 
+                       hc.order = T, 
+                       hc.method = "complete", 
+                       outline.color = "black", 
+                       type = "lower")
+
+sf1 <- cormat$data %>% 
+  mutate(ind = ifelse(value > 0, "red", "white")) %>% 
+  ggplot(., aes(x = Var1, y = Var2, fill = ind, label = value)) +
+  geom_tile(color = "black") +
+  geom_text(size = 6 / (14/5)) +
+  scale_fill_identity() +
+  theme_minimal(base_size = text_size) +
+  theme(axis.title = element_blank(),
+        axis.text.x = element_text(angle = 60, hjust = 1)) +
+  coord_fixed()
+
+ggsave("./images/publication/supplementary_figure1.svg", 
+       sf1, device = "svg", width = width2, height = width2, units = "mm")
+```
+
